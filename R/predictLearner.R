@@ -89,21 +89,58 @@ predict.learner <- function(
     ))
   }
 
-  # Needed because this function uses dplyr at runtime
-  require_package("dplyr")
-
-  if (!all(fit$feature.names == rownames(feature_metadata))) {
-    stop("Both training feature_table and feature_metadata should have the same rownames.")
-  }
-
   if (is.null(feature_table_valid)) {
-    stop("Feature table for validation set cannot be empty")
+    stop("Feature table for validation set cannot be empty", call. = FALSE)
+  }
+  if (!identical(fit$feature.names, rownames(feature_metadata))) {
+    stop("Training features and feature_metadata must have identical row names in the same order.", call. = FALSE)
+  }
+  if (!identical(fit$feature.names, rownames(feature_table_valid))) {
+    stop("Training and validation feature tables must have identical row names in the same order.", call. = FALSE)
   }
 
-  if (!is.null(feature_table_valid)) {
-    if (!all(fit$feature.names == rownames(feature_table_valid))) {
-      stop("Both feature_table and feature_table_valid should have the same rownames.")
+  if (isTRUE(fit$run_intermediate) &&
+    is.null(fit$SL_fits$SL_fit_layers) &&
+    !is.null(fit$model_fits$model_cooperative)) {
+    if (!is.null(sample_metadata_valid)) {
+      if (is.null(outcome_col)) {
+        outcome_col <- fit$column_map$outcome_col %||% "Y"
+      }
+      if (is.null(subject_id_col)) {
+        subject_id_col <- fit$column_map$subject_id_col %||% "subjectID"
+      }
+      sample_metadata_valid <- normalize_sample_metadata_columns(
+        sample_metadata = sample_metadata_valid,
+        outcome_col = outcome_col,
+        subject_id_col = subject_id_col,
+        context = "sample_metadata_valid",
+        require_outcome = TRUE
+      )
+      sample_metadata_valid <- coerce_outcome_by_family(
+        sample_metadata = sample_metadata_valid,
+        family_name = fit$family,
+        context = "sample_metadata_valid",
+        binary_levels = fit$column_map$binary_levels
+      )$sample_metadata
     }
+    x_valid <- build_multiview_x_list(
+      feature_table = feature_table_valid,
+      feature_metadata = feature_metadata,
+      layers = fit$fusion_layers_retained
+    )
+    res <- list(yhat.test = data.frame(
+      cooperative = predict_cooperative_vector(fit$model_fits$model_cooperative, x_valid),
+      row.names = colnames(feature_table_valid),
+      check.names = FALSE
+    ))
+    if (!is.null(sample_metadata_valid)) {
+      res$Y_test <- sample_metadata_valid$Y
+    }
+    return(add_prediction_metrics(
+      result = res,
+      family_name = fit$family,
+      y_test = res$Y_test
+    ))
   }
 
   if (!is.null(sample_metadata_valid)) {
@@ -185,6 +222,17 @@ predict.learner <- function(
     )
   }
 
+  if (isTRUE(fit$run_intermediate) && !is.null(fit$model_fits$model_cooperative)) {
+    cooperative_x_valid <- build_multiview_x_list(
+      feature_table = feature_table_valid,
+      feature_metadata = feature_metadata,
+      layers = fusion_layers
+    )
+    cooperative_prediction_valid <- predict_cooperative_vector(
+      fit$model_fits$model_cooperative, cooperative_x_valid
+    )
+  }
+
   res <- list()
 
   if (!is.null(sample_metadata_valid)) {
@@ -197,10 +245,14 @@ predict.learner <- function(
     stacked_prediction = if (isTRUE(fit$run_stacked)) stacked_prediction_valid else NULL,
     concat_prediction = if (isTRUE(fit$run_concat)) concat_prediction_valid else NULL
   )
+  if (isTRUE(fit$run_intermediate) && !is.null(fit$model_fits$model_cooperative)) {
+    res$yhat.test <- cbind(res$yhat.test, cooperative_prediction_valid)
+    colnames(res$yhat.test)[ncol(res$yhat.test)] <- "cooperative"
+  }
   res <- add_prediction_metrics(
     result = res,
     family_name = fit$family,
-    y_test = res$Y_test %||% NULL
+    y_test = res$Y_test
   )
 
   return(res)

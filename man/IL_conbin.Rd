@@ -22,6 +22,10 @@ IL_conbin(
   meta_learner = "sl_nnls_auc",
   run_concat = TRUE,
   run_stacked = TRUE,
+  run_intermediate = FALSE,
+  cooperative_rho = c(0, 0.1, 0.25, 0.5, 1),
+  cooperative_s = "lambda.min",
+  cooperative_type_measure = NULL,
   drop_poor_performing_layers = FALSE,
   verbose = FALSE,
   print_learner = TRUE,
@@ -97,6 +101,20 @@ Defaults to \code{sl_nnls_auc}.}
 
 \item{run_stacked}{Should stacked model (late fusion) be run? Default is TRUE.}
 
+\item{run_intermediate}{Should standalone cooperative learning via
+\pkg{multiview} be run? Default is FALSE. When TRUE, only the cooperative
+multiview model is fit; base learners, early fusion, and late fusion are
+skipped.}
+
+\item{cooperative_rho}{Non-negative agreement-penalty values to evaluate for
+cooperative learning.}
+
+\item{cooperative_s}{Penalty value used when predicting from the selected
+cooperative model. Defaults to \code{"lambda.min"}.}
+
+\item{cooperative_type_measure}{Optional \pkg{multiview} CV loss/score. If
+\code{NULL}, an outcome-appropriate default is used.}
+
 \item{drop_poor_performing_layers}{Logical; if \code{TRUE}, layers with
 single-layer performance below the screening threshold are removed from
 early and late fusion only. The threshold is AUC < 0.5 for binary and
@@ -119,7 +137,13 @@ IL_survival().}
 \value{
 A list-like IntegratedLearner object containing fitted layer-specific,
 stacked, and concatenated models, cross-validated performance (AUC or R\302\262),
-and predictions for training and validation sets.
+and predictions for training and validation sets. When
+\code{run_intermediate = TRUE}, coefficient-based cooperative
+feature-importance scores from the selected \pkg{multiview} model are
+returned in \code{cooperative_feature_importance},
+\code{cooperative_feature_importance_by_layer},
+\code{cooperative_feature_importance_signed}, and
+\code{cooperative_feature_importance_signed_by_layer}.
 }
 \description{
 Performs integrated machine learning to predict a \strong{binary or continuous}

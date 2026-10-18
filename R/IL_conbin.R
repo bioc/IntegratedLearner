@@ -70,6 +70,16 @@
 #'   Defaults to \code{sl_nnls_auc}.
 #' @param run_concat Should early fusion be run? Default is TRUE.
 #' @param run_stacked Should stacked model (late fusion) be run? Default is TRUE.
+#' @param run_intermediate Should standalone cooperative learning via
+#'   \pkg{multiview} be run? Default is FALSE. When TRUE, only the cooperative
+#'   multiview model is fit; base learners, early fusion, and late fusion are
+#'   skipped.
+#' @param cooperative_rho Non-negative agreement-penalty values to evaluate for
+#'   cooperative learning.
+#' @param cooperative_s Penalty value used when predicting from the selected
+#'   cooperative model. Defaults to \code{"lambda.min"}.
+#' @param cooperative_type_measure Optional \pkg{multiview} CV loss/score. If
+#'   \code{NULL}, an outcome-appropriate default is used.
 #' @param drop_poor_performing_layers Logical; if \code{TRUE}, layers with
 #'   single-layer performance below the screening threshold are removed from
 #'   early and late fusion only. The threshold is AUC < 0.5 for binary and
@@ -86,7 +96,13 @@
 #'
 #' @return A list-like IntegratedLearner object containing fitted layer-specific,
 #'   stacked, and concatenated models, cross-validated performance (AUC or R\302\262),
-#'   and predictions for training and validation sets.
+#'   and predictions for training and validation sets. When
+#'   \code{run_intermediate = TRUE}, coefficient-based cooperative
+#'   feature-importance scores from the selected \pkg{multiview} model are
+#'   returned in \code{cooperative_feature_importance},
+#'   \code{cooperative_feature_importance_by_layer},
+#'   \code{cooperative_feature_importance_signed}, and
+#'   \code{cooperative_feature_importance_signed_by_layer}.
 #'
 #' @examples
 #' set.seed(1)
@@ -125,7 +141,9 @@ IL_conbin <- function(
   sample_metadata_valid = NULL, folds = 5, seed = 1234, base_learner = "sl_bart",
   base_screener = "All", run_screening = FALSE, screen_pct = NULL, filter_method = NULL,
   filter_pct = NULL, prevalence_pct = NULL, meta_learner = "sl_nnls_auc", run_concat = TRUE,
-  run_stacked = TRUE, drop_poor_performing_layers = FALSE, verbose = FALSE,
+  run_stacked = TRUE, run_intermediate = FALSE,
+  cooperative_rho = c(0, 0.1, 0.25, 0.5, 1), cooperative_s = "lambda.min",
+  cooperative_type_measure = NULL, drop_poor_performing_layers = FALSE, verbose = FALSE,
   print_learner = TRUE, refit.stack = FALSE, family = stats::gaussian(), ...
 ) {
   ############## Track time #
@@ -138,6 +156,39 @@ IL_conbin <- function(
     sample_metadata_valid = sample_metadata_valid, family_name = safe_family_name(family),
     is_survival = FALSE
   )
+
+  if (isTRUE(run_intermediate)) {
+    family_name <- safe_family_name(family)
+    coerced_train <- coerce_outcome_by_family(
+      sample_metadata = sample_metadata,
+      family_name = family_name,
+      context = "training sample_metadata"
+    )
+    sample_metadata <- coerced_train$sample_metadata
+    if (!is.null(sample_metadata_valid)) {
+      sample_metadata_valid <- coerce_outcome_by_family(
+        sample_metadata = sample_metadata_valid,
+        family_name = family_name,
+        context = "validation sample_metadata",
+        binary_levels = coerced_train$binary_levels
+      )$sample_metadata
+    }
+    if (isTRUE(run_screening)) {
+      message("'run_screening' is ignored for standalone cooperative multiview learning.")
+    }
+    if (isTRUE(drop_poor_performing_layers)) {
+      message("'drop_poor_performing_layers' is ignored for standalone cooperative multiview learning.")
+    }
+    return(fit_intermediate_conbin(
+      feature_table = feature_table, sample_metadata = sample_metadata,
+      feature_metadata = feature_metadata, feature_table_valid = feature_table_valid,
+      sample_metadata_valid = sample_metadata_valid, folds = folds, seed = seed,
+      family = family, cooperative_rho = cooperative_rho, cooperative_s = cooperative_s,
+      cooperative_type_measure = cooperative_type_measure, filter_method = filter_method,
+      filter_pct = filter_pct, prevalence_pct = prevalence_pct, verbose = verbose,
+      print_learner = print_learner
+    ))
+  }
 
   base_learner <- normalize_il_learner_id(base_learner, role = "base_learner")
   meta_learner <- normalize_il_learner_id(meta_learner, role = "meta_learner")
@@ -360,6 +411,36 @@ IL_conbin <- function(
 
   fusion_feature_ids <- feature_ids_for_layers(feature_metadata, fusion_layers_retained)
 
+  cooperative_fit <- NULL
+  cooperative_prediction_train <- NULL
+  cooperative_prediction_valid <- NULL
+  if (isTRUE(run_intermediate)) {
+    if (isTRUE(verbose)) {
+      message("Running cooperative multiview model...")
+    }
+    cooperative_x_train <- build_multiview_x_list(
+      feature_table = feature_table,
+      feature_metadata = feature_metadata,
+      layers = fusion_layers_retained
+    )
+    cooperative_fit <- fit_cooperative_multiview(
+      x_list = cooperative_x_train, y = Y, family_name = family_name,
+      fold_id = fold_id, rho = cooperative_rho, type_measure = cooperative_type_measure,
+      s = cooperative_s, seed = cooperative_seed(seed), trace.it = as.integer(isTRUE(verbose))
+    )
+    cooperative_prediction_train <- prevalidated_cooperative_vector(cooperative_fit)
+    if (!is.null(feature_table_valid)) {
+      cooperative_x_valid <- build_multiview_x_list(
+        feature_table = feature_table_valid,
+        feature_metadata = feature_metadata,
+        layers = fusion_layers_retained
+      )
+      cooperative_prediction_valid <- predict_cooperative_vector(
+        cooperative_fit, cooperative_x_valid
+      )
+    }
+  }
+
   #################### Stack all models #
 
   if (run_stacked) {
@@ -497,6 +578,20 @@ IL_conbin <- function(
     model_concat = if (isTRUE(run_concat)) model_concat else NULL,
     stacked_prediction_train = if (isTRUE(run_stacked)) stacked_prediction_train else NULL
   )
+  if (isTRUE(run_intermediate)) {
+    res$model_fits$model_cooperative <- cooperative_fit
+    res$yhat.train <- cbind(res$yhat.train, cooperative_prediction_train)
+    colnames(res$yhat.train)[ncol(res$yhat.train)] <- "cooperative"
+    cooperative_importance <- extract_cooperative_feature_importance(cooperative_fit)
+    res$cooperative_feature_importance <- cooperative_importance$importance
+    res$cooperative_feature_importance_by_layer <- cooperative_importance$importance_by_layer
+    res$cooperative_feature_importance_signed <- cooperative_importance$signed
+    res$cooperative_feature_importance_signed_by_layer <- cooperative_importance$signed_by_layer
+    if (!is.null(feature_table_valid)) {
+      res$yhat.test <- cbind(res$yhat.test, cooperative_prediction_valid)
+      colnames(res$yhat.test)[ncol(res$yhat.test)] <- "cooperative"
+    }
+  }
   if (!is.null(sample_metadata_valid)) {
     res$Y_test <- validY$Y
   }
@@ -520,6 +615,16 @@ IL_conbin <- function(
   res$prevalence_pct <- filtered$prevalence_pct
   res$run_concat <- run_concat
   res$run_stacked <- run_stacked
+  res$run_intermediate <- isTRUE(run_intermediate)
+  res$cooperative_rho <- if (isTRUE(run_intermediate)) cooperative_fit$rho else NULL
+  res$cooperative_rho_grid <- if (isTRUE(run_intermediate)) cooperative_fit$rho_grid else cooperative_rho
+  res$cooperative_rho_scores <- if (isTRUE(run_intermediate)) cooperative_fit$rho_scores else NULL
+  res$cooperative_s <- cooperative_s
+  res$cooperative_type_measure <- if (isTRUE(run_intermediate)) {
+    cooperative_fit$type_measure
+  } else {
+    cooperative_type_measure
+  }
   res$drop_poor_performing_layers <- isTRUE(drop_poor_performing_layers)
   res$fusion_layers_retained <- fusion_layers_retained
   res$fusion_layers_removed <- fusion_layers_removed

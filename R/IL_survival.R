@@ -1,15 +1,7 @@
 # BioC-friendly survival backend for IntegratedLearner.
 
-require_pkg <- function(pkg, method) {
-  if (!requireNamespace(pkg, quietly = TRUE)) {
-    stop("Method '", method, "' requires package '", pkg, "'. ", "Please install it before running this learner.",
-      call. = FALSE
-    )
-  }
-}
-
 safe_quantile_times <- function(times, probs = c(0.25, 0.5, 0.75)) {
-  tt <- as.numeric(stats::quantile(times, probs = probs, na.rm = TRUE))
+  tt <- stats::quantile(times, probs = probs, na.rm = TRUE)
   tt <- sort(unique(tt[is.finite(tt)]))
   if (length(tt) == 0L) {
     tt <- stats::median(times, na.rm = TRUE)
@@ -129,12 +121,8 @@ compute_ipcw_brier <- function(times, events, surv_mat, time_grid) {
   }
   csurv_btime[!is.finite(csurv_btime) | csurv_btime <= 0] <- Inf
 
-  brier <- vapply(seq_along(time_grid), function(j) {
-    t0 <- time_grid[j]
-    help1 <- as.integer(time_sorted <= t0 & event_sorted == 1)
-    help2 <- as.integer(time_sorted > t0)
-    mean(((0 - surv_ord[, j])^2 * help1 / csurv) + ((1 - surv_ord[, j])^2 * help2 / csurv_btime[j]))
-  }, numeric(1))
+  weights <- ipcw_brier_weights(time_sorted, event_sorted, time_grid, csurv, csurv_btime)
+  brier <- weighted_brier_values(surv_ord, weights)
 
   data.frame(time = time_grid, Brier = as.numeric(brier))
 }
@@ -163,7 +151,7 @@ integrated_brier <- function(time_grid, brier_vec) {
 }
 
 make_stratified_folds <- function(time_vec, event_vec, folds, seed = 123) {
-  set_seed_internal(seed)
+  withr::local_seed(as.integer(seed[1]))
   q <- stats::quantile(time_vec, probs = seq(0, 1, length.out = 6), na.rm = TRUE)
   q <- unique(q)
   if (length(q) < 2L) {
@@ -317,7 +305,7 @@ extract_survival_screen_cfg <- function(method_args = list()) {
   }
   p_parsed <- type.convert(as.character(method_args$screen_pct[[1]]), as.is = TRUE)
   p <- if (is.numeric(p_parsed)) {
-    as.numeric(p_parsed[[1]])
+    p_parsed[[1]]
   } else {
     NA_real_
   }
@@ -448,11 +436,9 @@ fit_surv_model <- function(method, x_train, time_train, event_train, method_args
   }
 
   if (method == "surv.rfsrc") {
-    require_pkg("randomForestSRC", method)
     method_args <- cap_mtry(method_args, p)
     defaults <- list(formula = fml, data = dat, ntree = 500, importance = TRUE)
-    rfsrc_fun <- get("rfsrc", envir = asNamespace("randomForestSRC"))
-    fit <- do.call(rfsrc_fun, utils::modifyList(defaults, method_args))
+    fit <- do.call(randomForestSRC::rfsrc, utils::modifyList(defaults, method_args))
     return(list(model = fit, feature_names = feat))
   }
 
@@ -463,7 +449,6 @@ fit_surv_model <- function(method, x_train, time_train, event_train, method_args
   }
 
   if (method == "surv.gbm") {
-    require_pkg("gbm", method)
     defaults <- list(
       formula = fml, data = dat, distribution = "coxph", n.trees = 2000,
       interaction.depth = 2, shrinkage = 0.01, bag.fraction = 0.7, train.fraction = 1,
@@ -474,7 +459,6 @@ fit_surv_model <- function(method, x_train, time_train, event_train, method_args
   }
 
   if (method == "surv.xgboost.cox") {
-    require_pkg("xgboost", method)
     label <- ifelse(event_train == 1, time_train, -time_train)
     dtrain <- xgboost::xgb.DMatrix(data = x_train, label = label)
 
@@ -496,7 +480,6 @@ fit_surv_model <- function(method, x_train, time_train, event_train, method_args
   }
 
   if (method == "surv.xgboost.aft") {
-    require_pkg("xgboost", method)
     dtrain <- xgboost::xgb.DMatrix(data = x_train)
     label_lower <- as.numeric(time_train)
     label_upper <- ifelse(event_train == 1, as.numeric(time_train), Inf)
@@ -522,7 +505,6 @@ fit_surv_model <- function(method, x_train, time_train, event_train, method_args
   }
 
   if (method == "surv.mboost") {
-    require_pkg("mboost", method)
     defaults <- list(
       x = x_train, y = y, family = mboost::CoxPH(), center = FALSE,
       control = mboost::boost_control(mstop = 250)
@@ -532,7 +514,6 @@ fit_surv_model <- function(method, x_train, time_train, event_train, method_args
   }
 
   if (method == "surv.bart") {
-    require_pkg("BART", method)
     max_features <- method_args$max_features
     feature_screen <- method_args$feature_screen
     max_events <- method_args$max_events
@@ -1142,49 +1123,29 @@ risk_to_surv_matrix <- function(
   eval_survfit_at_times(sf, time_grid)
 }
 
-ibs_optim <- function(
-  par, fit_list, time_grid, obj_surv, ot, csurv, csurv_btime,
-  time_sorted
-) {
-  w <- exp(c(par)) / (1 + sum(exp(par)))
-  w <- c(w, 1 - sum(w))
-
-  pred_arr <- array(dim = c(nrow(fit_list[[1]]), ncol(fit_list[[1]]), length(fit_list)))
-  for (i in seq_along(fit_list)) {
-    pred_arr[, , i] <- fit_list[[i]] * w[i]
-  }
-  survs <- rowSums(pred_arr, dims = 2)
-
-  bsc <- vapply(seq_along(time_grid), function(j) {
-    help1 <- as.integer(time_sorted <= time_grid[j] & obj_surv[ot, 2] == 1)
-    help2 <- as.integer(time_sorted > time_grid[j])
-    mean(((0 - survs[, j])^2 * help1 / csurv) + ((1 - survs[, j])^2 * help2 / csurv_btime[j]))
-  }, numeric(1))
-
-  idx <- 2:length(time_grid)
-  ret <- diff(time_grid) %*% ((bsc[idx - 1] + bsc[idx]) / 2)
-  as.numeric(ret / diff(range(time_grid)))
+# Shared IPCW calculation for reported Brier scores and fusion optimization.
+ipcw_brier_weights <- function(times, events, time_grid, censor_at_event, censor_at_grid) {
+  list(
+    event = sweep(outer(times, time_grid, `<=`) * (events == 1), 1L, censor_at_event, `/`),
+    survival = sweep(outer(times, time_grid, `>`), 2L, censor_at_grid, `/`)
+  )
 }
 
-ibs_measure <- function(
-  weights, fit_list, time_grid, obj_surv, ot, csurv, csurv_btime,
-  time_sorted
-) {
-  pred_arr <- array(dim = c(nrow(fit_list[[1]]), ncol(fit_list[[1]]), length(fit_list)))
-  for (i in seq_along(fit_list)) {
-    pred_arr[, , i] <- fit_list[[i]] * weights[i]
+weighted_brier_values <- function(surv_mat, weights) {
+  colMeans(surv_mat^2 * weights$event + (1 - surv_mat)^2 * weights$survival)
+}
+
+make_ibs_objective <- function(fit_list, time_grid, time_sorted, event_sorted, csurv, csurv_btime) {
+  # Flatten each layer once. Optimization varies only the layer weights, so each
+  # evaluation needs a matrix product rather than a samples x times x layers array.
+  design <- do.call(cbind, lapply(fit_list, as.vector))
+  n_samples <- nrow(fit_list[[1]])
+  weights <- ipcw_brier_weights(time_sorted, event_sorted, time_grid, csurv, csurv_btime)
+  function(par) {
+    layer_weights <- softmax_simplex(c(par, 0))
+    surv_mat <- matrix(design %*% layer_weights, nrow = n_samples)
+    integrated_brier(time_grid, weighted_brier_values(surv_mat, weights))
   }
-  survs <- rowSums(pred_arr, dims = 2)
-
-  bsc <- vapply(seq_along(time_grid), function(j) {
-    help1 <- as.integer(time_sorted <= time_grid[j] & obj_surv[ot, 2] == 1)
-    help2 <- as.integer(time_sorted > time_grid[j])
-    mean(((0 - survs[, j])^2 * help1 / csurv) + ((1 - survs[, j])^2 * help2 / csurv_btime[j]))
-  }, numeric(1))
-
-  idx <- 2:length(time_grid)
-  ret <- diff(time_grid) %*% ((bsc[idx - 1] + bsc[idx]) / 2)
-  as.numeric(ret / diff(range(time_grid)))
 }
 
 learn_weights <- function(
@@ -1224,7 +1185,6 @@ learn_weights <- function(
       stop("Missing layer survival matrices for IBS weighting.", call. = FALSE)
     }
 
-    obj_surv <- survival::Surv(times, events)
     ot <- order(times)
     time_sorted <- as.numeric(times[ot])
 
@@ -1243,15 +1203,14 @@ learn_weights <- function(
     }
     csurv_btime[!is.finite(csurv_btime) | csurv_btime <= 0] <- Inf
 
-    init_par <- rep(0, n_layers - 1L)
+    objective <- make_ibs_objective(
+      fit_list, ibs_time_grid, time_sorted, events[ot], csurv, csurv_btime
+    )
     opt <- stats::optim(
-      par = init_par, fn = ibs_optim, fit_list = fit_list,
-      time_grid = ibs_time_grid, obj_surv = obj_surv, ot = ot, csurv = csurv,
-      csurv_btime = csurv_btime, time_sorted = time_sorted, method = "L-BFGS-B",
+      par = rep(0, n_layers - 1L), fn = objective, method = "L-BFGS-B",
       control = list(maxit = ibs_maxit)
     )
-    tmp <- exp(c(opt$par)) / (1 + sum(exp(opt$par)))
-    w <- c(tmp, 1 - sum(tmp))
+    w <- softmax_simplex(c(opt$par, 0))
     names(w) <- layers
 
     if (ibs_shrink_to_uniform > 0) {
@@ -1369,6 +1328,8 @@ ILsurv_bioc_core <- function(
     "entropy"
   ), cox_weight_cap = 1,
   cox_optim_maxit = 4000, verbose = FALSE, model_args = list()
+  , run_intermediate = FALSE, cooperative_rho = c(0, 0.1, 0.25, 0.5, 1),
+  cooperative_s = "lambda.min", cooperative_type_measure = NULL
 ) {
   vmsg <- function(...) {
     if (isTRUE(verbose)) {
@@ -1521,6 +1482,14 @@ ILsurv_bioc_core <- function(
     vmsg("Skipping early fusion (do_early_fusion = FALSE)")
   }
 
+  feature_importance_signed_by_layer <- lapply(names(importance_list), function(lay) {
+    imp <- importance_list[[lay]]
+    sgn <- sign_list[[lay]]
+    out <- imp * sgn[names(imp)]
+    sort(out, decreasing = TRUE, na.last = TRUE)
+  })
+  names(feature_importance_signed_by_layer) <- names(importance_list)
+
   vmsg("Preparing survival-matrix weighting inputs from layer risks")
   ibs_time_grid <- ibs_time_grid(times, n_grid = as.integer(ibs_grid_n))
   layer_surv_train <- list()
@@ -1583,6 +1552,39 @@ ILsurv_bioc_core <- function(
       combined_importance = combined_importance,
       train_risk = combined_train_risk
     )
+  }
+
+  cooperative_train <- NULL
+  if (isTRUE(run_intermediate)) {
+    vmsg("Running cooperative multiview survival model")
+    cooperative_x_train <- build_multiview_x_list(
+      feature_table = feature_table,
+      feature_metadata = feature_metadata,
+      layers = fusion_layers_retained
+    )
+    coop_y <- survival::Surv(times, events)
+    cooperative_fit <- fit_cooperative_multiview(
+      x_list = cooperative_x_train, y = coop_y, family_name = "survival",
+      fold_id = fold_id, rho = cooperative_rho, type_measure = cooperative_type_measure,
+      s = cooperative_s, seed = cooperative_seed(seed), trace.it = as.integer(isTRUE(verbose))
+    )
+    cooperative_train_risk <- prevalidated_cooperative_vector(cooperative_fit)
+    cooperative_met <- compute_auc_cindex(times, events, cooperative_train_risk)
+    cooperative_importance <- extract_cooperative_feature_importance(cooperative_fit)
+    cooperative_train <- list(
+      model = cooperative_fit,
+      train_cindex = cooperative_met$cindex,
+      train_auc = cooperative_met$auc,
+      train_auc_mean = cooperative_met$auc_mean,
+      train_brier = cooperative_met$brier,
+      train_ibs = cooperative_met$ibs,
+      train_risk = cooperative_train_risk,
+      feature_importance = cooperative_importance$importance,
+      feature_importance_by_layer = cooperative_importance$importance_by_layer,
+      feature_importance_signed = cooperative_importance$signed,
+      feature_importance_signed_by_layer = cooperative_importance$signed_by_layer
+    )
+    vmsg("  [cooperative] cindex=", fmt(cooperative_train$train_cindex))
   }
 
   valid_out_formatted <- NULL
@@ -1666,6 +1668,28 @@ ILsurv_bioc_core <- function(
       vmsg("  [valid early] cindex=", fmt(early_valid$cindex))
     }
 
+    cooperative_valid <- NULL
+    if (isTRUE(run_intermediate) && !is.null(cooperative_train$model)) {
+      cooperative_x_valid <- build_multiview_x_list(
+        feature_table = valid_feature_table,
+        feature_metadata = feature_metadata,
+        layers = fusion_layers_retained
+      )
+      cooperative_valid_risk <- predict_cooperative_vector(
+        cooperative_train$model, cooperative_x_valid
+      )
+      cooperative_valid_met <- compute_auc_cindex(V_times, V_events, cooperative_valid_risk)
+      cooperative_valid <- list(
+        valid_cindex = cooperative_valid_met$cindex,
+        valid_auc = cooperative_valid_met$auc,
+        valid_auc_mean = cooperative_valid_met$auc_mean,
+        valid_brier = cooperative_valid_met$brier,
+        valid_ibs = cooperative_valid_met$ibs,
+        valid_risk = cooperative_valid_risk
+      )
+      vmsg("  [valid cooperative] cindex=", fmt(cooperative_valid$valid_cindex))
+    }
+
     valid_out_formatted <- list(single = list(
       valid_cindex = lapply(
         single_valid_metrics,
@@ -1684,13 +1708,17 @@ ILsurv_bioc_core <- function(
         valid_auc = early_valid$auc, valid_auc_mean = early_valid$auc_mean, valid_brier = early_valid$brier,
         valid_ibs = early_valid$ibs, valid_risk = risk_early_v
       )
-    }, late = late_valid_results)
+    }, late = late_valid_results, cooperative = cooperative_valid)
   } else {
     vmsg("No validation data provided; skipping validation metrics")
   }
 
   train_out <- list(
-    single = list(metrics = single_layer_metrics, train_risk = preds_list), early = if (is.null(early_fusion_out)) {
+    single = list(
+      metrics = single_layer_metrics,
+      train_risk = preds_list,
+      feature_importance_signed_by_layer = feature_importance_signed_by_layer
+    ), early = if (is.null(early_fusion_out)) {
       NULL
     } else {
       list(
@@ -1699,7 +1727,7 @@ ILsurv_bioc_core <- function(
         train_brier = early_fusion_out$train_brier, train_ibs = early_fusion_out$train_ibs,
         combined_importance = early_fusion_out$combined_importance, train_risk = early_fusion_out$train_risk
       )
-    }, late = late_train_results
+    }, late = late_train_results, cooperative = cooperative_train
   )
 
   vmsg("ILsurv completed")
@@ -1717,6 +1745,12 @@ ILsurv_bioc_core <- function(
     ),
     drop_poor_performing_layers = isTRUE(drop_poor_performing_layers),
     late_methods = late_methods,
+    run_intermediate = isTRUE(run_intermediate),
+    cooperative_rho = if (isTRUE(run_intermediate)) cooperative_train$model$rho else NULL,
+    cooperative_rho_grid = if (isTRUE(run_intermediate)) cooperative_train$model$rho_grid else cooperative_rho,
+    cooperative_rho_scores = if (isTRUE(run_intermediate)) cooperative_train$model$rho_scores else NULL,
+    cooperative_s = cooperative_s,
+    cooperative_type_measure = if (isTRUE(run_intermediate)) cooperative_train$model$type_measure else cooperative_type_measure,
     fusion_layers_retained = fusion_layers_retained,
     fusion_layers_removed = fusion_layers_removed,
     fusion_layer_scores = fusion_layer_filter$scores,
@@ -1753,13 +1787,29 @@ ILsurv_bioc_core <- function(
 #' @param optim_maxit_ibs Maximum iterations for IBS-weight optimization.
 #' @param ibs_shrink_to_uniform Optional convex shrinkage of IBS weights toward
 #'   uniform.
+#' @param run_intermediate Should standalone cooperative learning via
+#'   \pkg{multiview} be run? Default is FALSE. When TRUE, only the cooperative
+#'   multiview Cox model is fit; survival base learners, early fusion, and late
+#'   fusion are skipped.
+#' @param cooperative_rho Non-negative agreement-penalty values to evaluate for
+#'   cooperative learning.
+#' @param cooperative_s Penalty value used when predicting from the selected
+#'   cooperative model. Defaults to \code{"lambda.min"}.
+#' @param cooperative_type_measure Optional \pkg{multiview} CV loss/score. If
+#'   \code{NULL}, Harrell's C is used.
 #' @param ... Additional base-learner hyperparameters passed to
 #'   \code{base_learner}. You may also pass \code{model_args = list(...)} as a
 #'   named list where each entry is keyed by learner ID.
 #'
-#' @return List with \code{train_out} and \code{valid_out}. Late-fusion results
+#' @return List with \code{train_out} and \code{valid_out}. Single-layer
+#'   survival outputs include \code{train_out$single$metrics},
+#'   \code{train_out$single$train_risk}, and
+#'   \code{train_out$single$feature_importance_signed_by_layer}, a named list of
+#'   unweighted signed feature-importance scores by layer. Late-fusion results
 #'   are returned under \code{train_out$late$IBS}, \code{train_out$late$COX},
-#'   and the analogous validation entries.
+#'   and the analogous validation entries. When \code{run_intermediate = TRUE},
+#'   \code{train_out$cooperative} includes coefficient-based cooperative
+#'   feature-importance scores from the selected \pkg{multiview} Cox model.
 #'
 #' @examples
 #' set.seed(1)
@@ -1797,7 +1847,9 @@ ILsurv <- function(
     0.75, 0.95
   ), layer_score = c("sum", "mean", "l2"), eps = 1e-12, weight_lambda = 0.02,
   weight_penalty = c("l2_to_uniform", "entropy"), weight_cap = 1, optim_maxit_cox = 4000,
-  optim_maxit_ibs = 300, ibs_shrink_to_uniform = 0,
+  optim_maxit_ibs = 300, ibs_shrink_to_uniform = 0, run_intermediate = FALSE,
+  cooperative_rho = c(0, 0.1, 0.25, 0.5, 1), cooperative_s = "lambda.min",
+  cooperative_type_measure = NULL,
   ...
 ) {
   layer_score <- match.arg(layer_score)
@@ -1811,6 +1863,26 @@ ILsurv <- function(
       "'IBS' and 'COX' late-fusion outputs under train_out$late and valid_out$late.",
       call. = FALSE
     )
+  }
+
+  if (isTRUE(run_intermediate)) {
+    if (isTRUE(run_screening)) {
+      message("'run_screening' is ignored for standalone cooperative multiview learning.")
+    }
+    if (isTRUE(drop_poor_performing_layers)) {
+      message("'drop_poor_performing_layers' is ignored for standalone cooperative multiview learning.")
+    }
+    sample_metadata <- ensure_survival_metadata(sample_metadata, context = "training")
+    valid_sample_metadata <- ensure_survival_metadata(valid_sample_metadata,
+      context = "validation"
+    )
+    return(fit_intermediate_survival(
+      feature_table = feature_table, sample_metadata = sample_metadata,
+      feature_metadata = feature_metadata, valid_feature_table = valid_feature_table,
+      valid_sample_metadata = valid_sample_metadata, folds = folds, seed = seed,
+      cooperative_rho = cooperative_rho, cooperative_s = cooperative_s,
+      cooperative_type_measure = cooperative_type_measure, verbose = verbose
+    ))
   }
 
   model_args <- list()
@@ -1839,7 +1911,9 @@ ILsurv <- function(
     cox_t_vec = t_vec, cox_t_vec_probs = t_vec_probs, cox_layer_score = layer_score,
     cox_eps = eps, cox_weight_lambda = weight_lambda, cox_weight_penalty = weight_penalty,
     cox_weight_cap = weight_cap, cox_optim_maxit = optim_maxit_cox,
-    verbose = verbose, model_args = model_args
+    verbose = verbose, model_args = model_args, run_intermediate = run_intermediate,
+    cooperative_rho = cooperative_rho, cooperative_s = cooperative_s,
+    cooperative_type_measure = cooperative_type_measure
   )
 
   out <- list(
@@ -1850,6 +1924,12 @@ ILsurv <- function(
     fold_id = res$fold_id, folds = folds, test = !is.null(valid_sample_metadata),
     drop_poor_performing_layers = res$drop_poor_performing_layers,
     late_methods = res$late_methods,
+    run_intermediate = res$run_intermediate,
+    cooperative_rho = res$cooperative_rho,
+    cooperative_rho_grid = res$cooperative_rho_grid,
+    cooperative_rho_scores = res$cooperative_rho_scores,
+    cooperative_s = res$cooperative_s,
+    cooperative_type_measure = res$cooperative_type_measure,
     fusion_layers_retained = res$fusion_layers_retained,
     fusion_layers_removed = res$fusion_layers_removed,
     fusion_layer_scores = res$fusion_layer_scores,

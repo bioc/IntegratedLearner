@@ -26,6 +26,10 @@ IntegratedLearner(
   meta_learner = "sl_nnls_auc",
   run_concat = TRUE,
   run_stacked = TRUE,
+  run_intermediate = FALSE,
+  cooperative_rho = c(0, 0.1, 0.25, 0.5, 1),
+  cooperative_s = "lambda.min",
+  cooperative_type_measure = NULL,
   drop_poor_performing_layers = FALSE,
   verbose = FALSE,
   print_learner = TRUE,
@@ -114,6 +118,22 @@ Uses the specified \code{base_learner} as the learning algorithm.}
 
 \item{run_stacked}{Should stacked model (late fusion) be run? Default is TRUE.}
 
+\item{run_intermediate}{Should standalone cooperative learning via
+\pkg{multiview} be run? Default is FALSE. When TRUE, IntegratedLearner
+runs only the cooperative multiview model and skips base learners, early
+fusion, and late fusion. Supported for continuous, binary, and survival
+outcomes; ignored with a message for multiclass outcomes.}
+
+\item{cooperative_rho}{Non-negative agreement-penalty values to evaluate for
+cooperative learning. A separate \code{cv.multiview()} fit is trained for
+each value, and the best value is selected by cross-validation.}
+
+\item{cooperative_s}{Penalty value used when predicting from the selected
+cooperative model. Defaults to \code{"lambda.min"}.}
+
+\item{cooperative_type_measure}{Optional \pkg{multiview} CV loss/score. If
+\code{NULL}, an outcome-appropriate default is used.}
+
 \item{drop_poor_performing_layers}{Logical; if \code{TRUE}, layers with
 poor single-layer performance are removed from early and late fusion only.
 The thresholds are AUC < 0.5 for binary, R\eqn{^2} < 0.5 for continuous,
@@ -140,7 +160,9 @@ for time-to-event outcomes. Determines whether \code{IL_conbin} or
 A list-like IntegratedLearner object containing the trained model fits
 (layer-specific, stacked, and/or concatenated models), cross-validated
 performance estimates, and predicted values for training and, if supplied,
-validation data.
+validation data. When \code{run_intermediate = TRUE}, the object also
+includes coefficient-based cooperative feature-importance scores from the
+selected \pkg{multiview} model.
 }
 \description{
 Performs integrated machine learning to predict a binary, continuous, or
@@ -172,7 +194,9 @@ PCL-style inputs remain available for backward compatibility, but the
 primary user-facing workflow is MAE-based.
 }
 \examples{
-data("PRISM_MAE", package = "IntegratedLearner")
+PRISM_MAE <- readRDS(system.file(
+  "extdata", "PRISM_MAE.rds", package = "IntegratedLearner", mustWork = TRUE
+))
 mae <- PRISM_MAE
 names(MultiAssayExperiment::experiments(mae))
 head(as.data.frame(S4Vectors::DataFrame(MultiAssayExperiment::colData(mae)))[, 1:4])

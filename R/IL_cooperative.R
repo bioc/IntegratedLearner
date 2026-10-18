@@ -1,0 +1,496 @@
+build_multiview_x_list <- function(feature_table, feature_metadata, layers) {
+  x_list <- lapply(layers, function(lay) {
+    feat_ids <- rownames(feature_metadata)[feature_metadata$featureType == lay]
+    mat <- as.matrix(t(feature_table[feat_ids, , drop = FALSE]))
+    storage.mode(mat) <- "double"
+    mat
+  })
+  names(x_list) <- layers
+  x_list
+}
+
+default_multiview_type_measure <- function(family_name) {
+  family_name <- safe_family_name(family_name)
+  if (identical(family_name, "gaussian")) {
+    return("mse")
+  }
+  if (identical(family_name, "binomial")) {
+    return("auc")
+  }
+  if (identical(family_name, "multinomial")) {
+    stop("Cooperative multiview learning is not supported for multiclass outcomes.",
+      call. = FALSE
+    )
+  }
+  if (identical(family_name, "cox") || identical(family_name, "survival")) {
+    return("C")
+  }
+  "default"
+}
+
+multiview_family_arg <- function(family_name) {
+  family_name <- safe_family_name(family_name)
+  if (identical(family_name, "survival")) {
+    return("cox")
+  }
+  if (identical(family_name, "multinomial")) {
+    stop("Cooperative multiview learning is not supported for multiclass outcomes.",
+      call. = FALSE
+    )
+  }
+  if (identical(family_name, "binomial")) {
+    return(stats::binomial())
+  }
+  if (identical(family_name, "gaussian")) {
+    return(stats::gaussian())
+  }
+  family_name
+}
+
+cooperative_score_is_larger_better <- function(type_measure) {
+  type_measure %in% c("auc", "C")
+}
+
+best_cooperative_cv_score <- function(cv_fit, type_measure) {
+  cvm <- as.numeric(cv_fit$cvm)
+  if (cooperative_score_is_larger_better(type_measure)) {
+    max(cvm, na.rm = TRUE)
+  } else {
+    min(cvm, na.rm = TRUE)
+  }
+}
+
+fit_cooperative_multiview <- function(
+  x_list, y, family_name, fold_id, rho = c(0, 0.1, 0.25, 0.5, 1),
+  type_measure = NULL, s = "lambda.min", seed = 1234, trace.it = 0, ...
+) {
+  if (is.null(type_measure)) {
+    type_measure <- default_multiview_type_measure(family_name)
+  }
+  rho <- unique(as.numeric(rho))
+  if (length(rho) == 0L || any(!is.finite(rho)) || any(rho < 0)) {
+    stop("'cooperative_rho' must contain one or more non-negative finite values.",
+      call. = FALSE
+    )
+  }
+  if (length(unique(fold_id)) < 3L) {
+    stop("Cooperative multiview learning requires at least 3 cross-validation folds.",
+      call. = FALSE
+    )
+  }
+
+  withr::local_seed(as.integer(seed[1]))
+  family_arg <- multiview_family_arg(family_name)
+  fits <- lapply(rho, function(r) {
+    multiview::cv.multiview(
+      x_list = x_list, y = y, family = family_arg, rho = r,
+      foldid = fold_id, type.measure = type_measure, keep = TRUE,
+      trace.it = trace.it, ...
+    )
+  })
+  names(fits) <- paste0("rho_", rho)
+
+  scores <- vapply(fits, best_cooperative_cv_score,
+    numeric(1), type_measure = type_measure
+  )
+  best_idx <- if (cooperative_score_is_larger_better(type_measure)) {
+    which.max(scores)
+  } else {
+    which.min(scores)
+  }
+
+  list(
+    learner_id = "multiview",
+    model = fits[[best_idx]],
+    all_models = fits,
+    rho = rho[[best_idx]],
+    rho_grid = rho,
+    rho_scores = stats::setNames(scores, rho),
+    type_measure = type_measure,
+    s = s,
+    family = safe_family_name(family_name),
+    layer_names = names(x_list),
+    feature_names_by_layer = lapply(x_list, colnames)
+  )
+}
+
+parse_cooperative_coef_name <- function(coef_name, feature_names_by_layer) {
+  layer_names <- names(feature_names_by_layer)
+  for (lay in layer_names) {
+    prefix <- paste0(lay, ":")
+    if (startsWith(coef_name, prefix)) {
+      return(list(layer = lay, feature = substring(coef_name, nchar(prefix) + 1L)))
+    }
+  }
+
+  matching_layers <- layer_names[vapply(feature_names_by_layer, function(features) {
+    coef_name %in% features
+  }, logical(1))]
+  if (length(matching_layers) == 1L) {
+    return(list(layer = matching_layers, feature = coef_name))
+  }
+  list(layer = NA_character_, feature = coef_name)
+}
+
+extract_cooperative_feature_importance <- function(fit_obj) {
+  coef_mat <- tryCatch(
+    stats::coef(fit_obj$model, s = fit_obj$s),
+    error = function(e) NULL
+  )
+  feature_names_by_layer <- fit_obj$feature_names_by_layer
+  if (is.null(coef_mat) || is.null(feature_names_by_layer)) {
+    return(list(
+      importance = numeric(),
+      importance_by_layer = stats::setNames(vector("list", length(fit_obj$layer_names)), fit_obj$layer_names),
+      signed = numeric(),
+      signed_by_layer = stats::setNames(vector("list", length(fit_obj$layer_names)), fit_obj$layer_names)
+    ))
+  }
+
+  coef_vec <- as.numeric(as.matrix(coef_mat)[, 1])
+  coef_names <- rownames(coef_mat)
+  keep <- !is.na(coef_names) & coef_names != "(Intercept)"
+  coef_vec <- coef_vec[keep]
+  coef_names <- coef_names[keep]
+
+  parsed <- lapply(coef_names, parse_cooperative_coef_name,
+    feature_names_by_layer = feature_names_by_layer
+  )
+  layers <- vapply(parsed, `[[`, character(1), "layer")
+  features <- vapply(parsed, `[[`, character(1), "feature")
+
+  signed <- coef_vec
+  names(signed) <- ifelse(is.na(layers), features, paste(layers, features, sep = "::"))
+  signed <- sort(signed, decreasing = TRUE, na.last = TRUE)
+
+  importance <- abs(coef_vec)
+  names(importance) <- ifelse(is.na(layers), features, paste(layers, features, sep = "::"))
+  importance <- sort(importance, decreasing = TRUE, na.last = TRUE)
+
+  layer_names <- names(feature_names_by_layer)
+  signed_by_layer <- lapply(layer_names, function(lay) {
+    idx <- which(layers == lay)
+    out <- coef_vec[idx]
+    names(out) <- features[idx]
+    sort(out, decreasing = TRUE, na.last = TRUE)
+  })
+  names(signed_by_layer) <- layer_names
+
+  importance_by_layer <- lapply(layer_names, function(lay) {
+    idx <- which(layers == lay)
+    out <- abs(coef_vec[idx])
+    names(out) <- features[idx]
+    sort(out, decreasing = TRUE, na.last = TRUE)
+  })
+  names(importance_by_layer) <- layer_names
+
+  list(
+    importance = importance,
+    importance_by_layer = importance_by_layer,
+    signed = signed,
+    signed_by_layer = signed_by_layer
+  )
+}
+
+cooperative_lambda_index <- function(cv_fit, s = "lambda.min") {
+  if (is.character(s) && identical(s, "lambda.min")) {
+    return(as.integer(cv_fit$index["min", 1]))
+  }
+  if (is.character(s) && identical(s, "lambda.1se")) {
+    return(as.integer(cv_fit$index["1se", 1]))
+  }
+  if (is.numeric(s) && length(s) == 1L && is.finite(s)) {
+    return(which.min(abs(cv_fit$lambda - s)))
+  }
+  stop("'cooperative_s' must be 'lambda.min', 'lambda.1se', or a single numeric lambda.",
+    call. = FALSE
+  )
+}
+
+prevalidated_cooperative_vector <- function(fit_obj) {
+  idx <- cooperative_lambda_index(fit_obj$model, fit_obj$s)
+  pred <- as.numeric(fit_obj$model$fit.preval[, idx])
+  if (identical(safe_family_name(fit_obj$family), "binomial")) {
+    pred <- stats::plogis(pred)
+  }
+  pred
+}
+
+predict_cooperative_multiview <- function(fit_obj, x_list, type = NULL) {
+  family_name <- safe_family_name(fit_obj$family)
+  if (is.null(type)) {
+    type <- if (family_name %in% c("binomial", "multinomial")) {
+      "response"
+    } else {
+      "link"
+    }
+  }
+  stats::predict(
+    fit_obj$model, newx = x_list, s = fit_obj$s, type = type
+  )
+}
+
+predict_cooperative_vector <- function(fit_obj, x_list) {
+  pred <- predict_cooperative_multiview(fit_obj, x_list)
+  as.numeric(drop(pred))
+}
+
+# Outcome-specific callers supply the response and fold IDs. Matrix construction,
+# cooperative tuning, and result metadata stay shared across outcome families.
+fit_intermediate_model <- function(
+  feature_table, feature_metadata, y, family_name, fold_id, seed,
+  cooperative_rho, cooperative_s, cooperative_type_measure, verbose
+) {
+  layers <- extract_layer_names(feature_metadata)
+  x_train <- build_multiview_x_list(feature_table, feature_metadata, layers)
+  if (isTRUE(verbose)) {
+    message("Running standalone cooperative multiview model (", family_name, ")...")
+  }
+  model <- fit_cooperative_multiview(
+    x_list = x_train, y = y, family_name = family_name, fold_id = fold_id,
+    rho = cooperative_rho, type_measure = cooperative_type_measure,
+    s = cooperative_s, seed = cooperative_seed(seed),
+    trace.it = as.integer(isTRUE(verbose))
+  )
+  list(model = model, x_train = x_train, layers = layers)
+}
+
+intermediate_result_metadata <- function(model, layers, feature_names, importance) {
+  list(
+    base_learner = NULL,
+    screening_used = FALSE,
+    screen_method = NULL,
+    screen_pct = NULL,
+    run_intermediate = TRUE,
+    cooperative_rho = model$rho,
+    cooperative_rho_grid = model$rho_grid,
+    cooperative_rho_scores = model$rho_scores,
+    cooperative_s = model$s,
+    cooperative_type_measure = model$type_measure,
+    drop_poor_performing_layers = FALSE,
+    fusion_layers_retained = layers,
+    fusion_layers_removed = character(),
+    fusion_layer_scores = NULL,
+    fusion_layer_metric = NULL,
+    fusion_layer_threshold = NULL,
+    cooperative_feature_importance = importance$importance,
+    cooperative_feature_importance_by_layer = importance$importance_by_layer,
+    cooperative_feature_importance_signed = importance$signed,
+    cooperative_feature_importance_signed_by_layer = importance$signed_by_layer,
+    feature.names = feature_names
+  )
+}
+
+fit_intermediate_conbin <- function(
+  feature_table, sample_metadata, feature_metadata, feature_table_valid = NULL,
+  sample_metadata_valid = NULL, folds = 5, seed = 1234, family = stats::gaussian(),
+  cooperative_rho = c(0, 0.1, 0.25, 0.5, 1), cooperative_s = "lambda.min",
+  cooperative_type_measure = NULL, filter_method = NULL, filter_pct = NULL,
+  prevalence_pct = NULL, verbose = FALSE, print_learner = TRUE
+) {
+  start.time <- Sys.time()
+  family_name <- safe_family_name(family)
+
+  filtered <- filter_features_by_method(
+    feature_table = feature_table, feature_metadata = feature_metadata,
+    feature_table_valid = feature_table_valid, filter_method = filter_method,
+    filter_pct = filter_pct, prevalence_pct = prevalence_pct, verbose = verbose
+  )
+  feature_table <- filtered$feature_table
+  feature_metadata <- filtered$feature_metadata
+  feature_table_valid <- filtered$feature_table_valid
+
+  cv_partition <- build_subject_cv_partition(
+    sample_metadata = sample_metadata,
+    folds = folds,
+    seed = seed
+  )
+  y_train <- sample_metadata$Y
+  shared <- fit_intermediate_model(
+    feature_table, feature_metadata, y_train, family_name, cv_partition$fold_id,
+    seed, cooperative_rho, cooperative_s, cooperative_type_measure, verbose
+  )
+  x_train <- shared$x_train
+  layer_names <- shared$layers
+  cooperative_fit <- shared$model
+  yhat_train <- data.frame(
+    cooperative = prevalidated_cooperative_vector(cooperative_fit),
+    row.names = rownames(sample_metadata),
+    check.names = FALSE
+  )
+
+  res <- list(
+    model_fits = list(model_cooperative = cooperative_fit),
+    SL_fits = list(),
+    X_train_layers = x_train,
+    Y_train = y_train,
+    yhat.train = yhat_train
+  )
+
+  if (!is.null(feature_table_valid)) {
+    x_valid <- build_multiview_x_list(
+      feature_table = feature_table_valid,
+      feature_metadata = feature_metadata,
+      layers = layer_names
+    )
+    res$X_test_layers <- x_valid
+    res$yhat.test <- data.frame(
+      cooperative = predict_cooperative_vector(cooperative_fit, x_valid),
+      row.names = colnames(feature_table_valid),
+      check.names = FALSE
+    )
+  }
+  if (!is.null(sample_metadata_valid)) {
+    res$Y_test <- sample_metadata_valid$Y
+  }
+
+  res$meta_learner <- NULL
+  res$base_screener <- NULL
+  res$base_screener_used <- "none"
+  res$filter_method <- filtered$filter_method
+  res$filter_pct <- filtered$filter_pct
+  res$prevalence_pct <- filtered$prevalence_pct
+  res$run_concat <- FALSE
+  res$run_stacked <- FALSE
+  res$family <- family_name
+  res$test <- !is.null(sample_metadata_valid)
+  res$folds <- folds
+  res$fold_id <- cv_partition$fold_id
+  res$cvControl <- cv_partition$cv_control
+
+  res <- add_family_metrics(
+    result = res,
+    family_name = res$family,
+    y_train = res$Y_train,
+    y_test = if (isTRUE(res$test)) res$Y_test else NULL
+  )
+
+  cooperative_importance <- extract_cooperative_feature_importance(cooperative_fit)
+  res$feature_importance <- cooperative_importance$importance
+  res$feature_importance_by_layer <- cooperative_importance$importance_by_layer
+  res$feature_importance_signed <- cooperative_importance$signed
+  res$feature_importance_signed_by_layer <- cooperative_importance$signed_by_layer
+
+  stop.time <- Sys.time()
+  res$time <- as.numeric(round(difftime(stop.time, start.time, units = "min"), 3),
+    units = "mins"
+  )
+  metadata <- intermediate_result_metadata(
+    cooperative_fit, shared$layers, rownames(feature_table), cooperative_importance
+  )
+  res[names(metadata)] <- metadata
+  class(res) <- unique(c("cooperative_learner", "learner", class(res)))
+  if (isTRUE(print_learner)) {
+    print(res)
+  }
+  res
+}
+
+fit_intermediate_survival <- function(
+  feature_table, sample_metadata, feature_metadata, valid_feature_table = NULL,
+  valid_sample_metadata = NULL, folds = 5, seed = 123,
+  cooperative_rho = c(0, 0.1, 0.25, 0.5, 1), cooperative_s = "lambda.min",
+  cooperative_type_measure = NULL, verbose = FALSE
+) {
+  start.time <- Sys.time()
+  times <- as.numeric(sample_metadata$time)
+  events <- as.numeric(sample_metadata$event)
+  fold_id <- make_stratified_folds(times, events, folds = folds, seed = seed)
+  shared <- fit_intermediate_model(
+    feature_table, feature_metadata, survival::Surv(times, events), "survival",
+    fold_id, seed, cooperative_rho, cooperative_s, cooperative_type_measure, verbose
+  )
+  layers <- shared$layers
+  cooperative_fit <- shared$model
+  train_risk <- prevalidated_cooperative_vector(cooperative_fit)
+  train_met <- compute_auc_cindex(times, events, train_risk)
+  cooperative_importance <- extract_cooperative_feature_importance(cooperative_fit)
+  train_cooperative <- list(
+    model = cooperative_fit,
+    train_cindex = train_met$cindex,
+    train_auc = train_met$auc,
+    train_auc_mean = train_met$auc_mean,
+    train_brier = train_met$brier,
+    train_ibs = train_met$ibs,
+    train_risk = train_risk,
+    feature_importance = cooperative_importance$importance,
+    feature_importance_by_layer = cooperative_importance$importance_by_layer,
+    feature_importance_signed = cooperative_importance$signed,
+    feature_importance_signed_by_layer = cooperative_importance$signed_by_layer
+  )
+
+  valid_cooperative <- NULL
+  if (!is.null(valid_feature_table) && !is.null(valid_sample_metadata)) {
+    v_times <- as.numeric(valid_sample_metadata$time)
+    v_events <- as.numeric(valid_sample_metadata$event)
+    x_valid <- build_multiview_x_list(
+      feature_table = valid_feature_table,
+      feature_metadata = feature_metadata,
+      layers = layers
+    )
+    valid_risk <- predict_cooperative_vector(cooperative_fit, x_valid)
+    valid_met <- compute_auc_cindex(v_times, v_events, valid_risk)
+    valid_cooperative <- list(
+      valid_cindex = valid_met$cindex,
+      valid_auc = valid_met$auc,
+      valid_auc_mean = valid_met$auc_mean,
+      valid_brier = valid_met$brier,
+      valid_ibs = valid_met$ibs,
+      valid_risk = valid_risk
+    )
+  }
+
+  stop.time <- Sys.time()
+  res <- list(
+    train_out = list(single = NULL, early = NULL, late = NULL, cooperative = train_cooperative),
+    valid_out = if (!is.null(valid_cooperative)) {
+      list(single = NULL, early = NULL, late = NULL, cooperative = valid_cooperative)
+    } else {
+      NULL
+    },
+    backend = "cooperative_multiview",
+    supported_learners = "multiview",
+    fold_id = fold_id,
+    surv_plot_data = list(
+      train = list(time = times, event = events),
+      valid = if (!is.null(valid_sample_metadata)) {
+        list(time = as.numeric(valid_sample_metadata$time), event = as.numeric(valid_sample_metadata$event))
+      } else {
+        NULL
+      }
+    ),
+    late_methods = character(),
+    family = "survival",
+    time = as.numeric(round(difftime(stop.time, start.time, units = "min"), 3),
+      units = "mins"
+    )
+  )
+  metadata <- intermediate_result_metadata(
+    cooperative_fit, shared$layers, rownames(feature_table), cooperative_importance
+  )
+  res[names(metadata)] <- metadata
+  class(res) <- unique(c("cooperative_learner", "learner", class(res)))
+  res
+}
+
+#' @export
+print.cooperative_learner <- function(x, ...) {
+  cat("Time for model fit :", x$time, "minutes \n")
+  cat("========================================\n")
+  cat("Standalone cooperative multiview model\n")
+  cat("Selected rho:", x$cooperative_rho, "\n")
+  cat("Prediction lambda:", x$cooperative_s, "\n")
+  cat("CV metric:", x$cooperative_type_measure, "\n")
+  cat("========================================\n")
+  if (identical(x$family, "binomial") && !is.null(x$metrics.train)) {
+    cat("Binary training metrics:\n")
+    print(x$metrics.train)
+  } else if (identical(x$family, "gaussian") && !is.null(x$R2.train)) {
+    cat("Gaussian training R^2:\n")
+    print(x$R2.train)
+  } else if (identical(x$family, "survival") && !is.null(x$train_out$cooperative)) {
+    cat("Survival training C-index:\n")
+    print(x$train_out$cooperative$train_cindex)
+  }
+  invisible(x)
+}

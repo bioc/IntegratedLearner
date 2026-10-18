@@ -2,18 +2,25 @@
 
 The repository houses the **`IntegratedLearner`** R package for multi-omics prediction and classification. Binary, multiclass, continuous, and survival outcomes are supported through a single high-level interface.
 
-## Dependencies
-
-`IntegratedLearner` requires the following `R` package: `devtools` (for installation only). Please install it before installing `IntegratedLearner`, which can be done as follows (execute from within a fresh R session):
-
-```r
-install.packages("devtools")
-library(devtools)
-```
-
 Optional dependency for BART workflows:
 - `sl_bart` and BART uncertainty utilities rely on `bartMachine` and a working Java setup.
-- If Java/BART are unavailable, use non-Java learners such as `SL.randomForest` (continuous/binary) or native multiclass learners.
+- If Java/BART are unavailable, use another continuous/binary learner (`SL.randomForest` is a standard SuperLearner alternative) or a native multiclass learner for multiclass outcomes.
+
+## Code entry points
+
+Use `IntegratedLearner()` to fit models and the S3 generics `predict()`, `plot()`,
+`print()`, and `update()` to work with fitted models. Existing low-level `IL_*`,
+`ILsurv`, and solver exports are retained for compatibility; package-provided
+SuperLearner wrappers use `sl_*` names.
+
+Seven small MAE tutorial fixtures live in `inst/extdata` and total about **258 KB**.
+Each assay has at most **25 variable features**; paired cohorts share feature IDs
+and order. All samples and outcomes are retained. Read the RDS files directly
+using `readRDS(system.file("extdata", "PRISM_MAE.rds", package = "IntegratedLearner"))`;
+see the [fixture inventory](inst/extdata/README.md) and
+[selection recipe](inst/scripts/build_mae_vignette_data.R). The former `data()`
+objects, raw tables, and duplicate PCL datasets have been removed. PCL inputs
+remain supported using user-supplied data.
 
 ## Installation
 
@@ -37,7 +44,7 @@ BiocManager::install("himelmallick/IntegratedLearner")
 * Supports binary, multiclass, continuous, and survival outcomes
 * Supports custom outcome/subject column names via `outcome_col` and `subject_id_col`
 * Supports early and late fusion in one interface
-* Integrates with [SuperLearner](https://cran.r-project.org/web/packages/SuperLearner/index.html) for binary/continuous models (`SL.*`)
+* Integrates with [SuperLearner](https://cran.r-project.org/web/packages/SuperLearner/index.html) for binary/continuous models, using IntegratedLearner `sl_*` wrappers by default (standard SuperLearner `SL.*` learners are also supported)
 * Includes a native multiclass backend with multiclass learners (`glmnet`, `randomforest`, `ranger`, `xgboost`, `mbart`, `multinom`)
 * Uses a native BioC-friendly survival backend (`ILsurv`) for `surv.*` models
 * Supports optional feature filtering (`filter_method`, `filter_pct`) and supervised screening (`run_screening`, `screen_pct`)
@@ -63,7 +70,11 @@ For multiclass outcomes (`family = binomial()` with more than two outcome classe
 
 For survival outcomes, `IntegratedLearner` dispatches to the native survival engine (`ILsurv`) with configurable late-fusion weighting (`COX`/`IBS`). Supported survival learners include Cox, penalized Cox, tree ensembles, boosting, and XGBoost-based survival variants (see full list below).
 
-For binary/continuous non-survival tasks, standard `SuperLearner` learners still use the `SL.*` naming convention (for example, `SL.randomForest`, `SL.glmnet`). IntegratedLearner's package-specific wrappers now use snake_case names such as `sl_bart`, `sl_lasso`, and `sl_nnls_auc`. For multiclass, use multiclass learner IDs such as `randomforest`, `ranger`, `xgboost`, `glmnet`, `mbart`, or `multinom`.
+Naming conventions:
+
+* Use IntegratedLearner's snake_case `sl_*` wrappers for the documented defaults and package-provided learners, such as `sl_bart`, `sl_lasso`, and `sl_nnls_auc`.
+* Standard `SuperLearner` learners remain available with their upstream names (`SL.randomForest`, `SL.glmnet`).
+* Multiclass learners use native IDs without either prefix, such as `randomforest`, `ranger`, `xgboost`, `glmnet`, `mbart`, and `multinom`.
 
 Feature workflow (when enabled):
 1. Filtering happens first (`filter_method`, `filter_pct`) on the training feature table.
@@ -74,7 +85,11 @@ Feature workflow (when enabled):
 Recommended MAE-first Bioconductor workflow:
 
 ```r
-data("PRISM_MAE", package = "IntegratedLearner")
+library(IntegratedLearner)
+
+PRISM_MAE <- readRDS(system.file(
+  "extdata", "PRISM_MAE.rds", package = "IntegratedLearner", mustWork = TRUE
+))
 
 mae_train <- PRISM_MAE
 
@@ -97,7 +112,7 @@ IntegratedLearner(
   outcome_col = "Y",
   subject_id_col = "subjectID",
   folds = 5,
-  base_learner = "SL.randomForest",
+  base_learner = "sl_bart",
   meta_learner = "sl_nnls_auc",
   filter_method = "prevalence",
   filter_pct = 40,
@@ -158,7 +173,7 @@ IntegratedLearner(
   outcome_col = "disease_status",
   subject_id_col = "participant_id",
   folds = 5,
-  base_learner = "SL.randomForest",
+  base_learner = "sl_bart",
   meta_learner = "sl_nnls_auc",
   filter_method = "prevalence",
   filter_pct = 40,
@@ -180,17 +195,21 @@ Custom metadata names are optional. If omitted, defaults remain `outcome_col = "
 * `na.rm`: Logical; drop features containing missing values after extraction/prep.
 * `folds`: Integer. Number of folds for cross-validation. Default is `5`.
 * `seed`: Integer seed for reproducibility. Default is `1234`.
-* `base_learner`: Binary/continuous uses `SL.*`; multiclass uses native multiclass learners; survival uses supported `surv.*` learners.
+* `base_learner`: Binary/continuous uses IntegratedLearner `sl_*` wrappers by default (standard SuperLearner `SL.*` learners are also supported); multiclass uses native multiclass learners; survival uses supported `surv.*` learners. Not used when `run_intermediate = TRUE`.
 * `base_screener`: Deprecated. Kept for backward compatibility.
 * `filter_method`: Optional feature filtering method (`"prevalence"` or `"variance"`).
 * `filter_pct`: Optional retention percentage in `(0,100]` for filtering.
 * `run_screening`: Logical flag to enable supervised screening (`FALSE` by default).
 * `screen_pct`: Retention percentage in `(0,100]` for screening.
 * `prevalence_pct`: Deprecated alias of `filter_pct` when `filter_method = "prevalence"`.
-* `meta_learner`: Meta learner for non-survival late fusion. Defaults to `"sl_nnls_auc"` in binary/continuous; multiclass supports native learners (for example `glmnet`, `randomforest`, `xgboost`).
+* `meta_learner`: Meta learner for non-survival late fusion. Defaults to `"sl_nnls_auc"` in binary/continuous; multiclass supports native learners (for example `glmnet`, `randomforest`, `xgboost`). Not used when `run_intermediate = TRUE`.
 * `run_concat`: Logical; include early-fusion (concatenated) model for non-survival.
 * `run_stacked`: Logical; include late-fusion stacked model for non-survival.
-* `drop_poor_performing_layers`: If `TRUE`, layers with poor single-layer performance are removed from early and late fusion only (`AUC < 0.5` for binary, `R2 < 0.5` for continuous, `C-index < 0.5` for survival). Single-layer outputs are still retained.
+* `run_intermediate`: Logical; run standalone direct cooperative learning via the `multiview` package. Default is `FALSE`. When `TRUE`, early fusion, late fusion, single-layer base learners, and supervised screening are skipped.
+* `cooperative_rho`: Non-negative agreement-penalty values to evaluate for cooperative learning. Default is `c(0, 0.1, 0.25, 0.5, 1)`.
+* `cooperative_s`: Penalty value used for cooperative predictions. Default is `"lambda.min"`.
+* `cooperative_type_measure`: Optional `multiview` CV loss/score. If `NULL`, IL uses an outcome-appropriate default.
+* `drop_poor_performing_layers`: If `TRUE`, layers with poor single-layer performance are removed from early and late fusion only (`AUC < 0.5` for binary, `R2 < 0.5` for continuous, `C-index < 0.5` for survival). Single-layer outputs are still retained. Ignored when `run_intermediate = TRUE`.
 * `family`: `gaussian()` (continuous), `binomial()` (binary or multiclass), or survival family/metadata.
 * `verbose`: Logical progress flag.
 * `...`: Additional backend parameters. For survival, includes options such as `do_early_fusion` and learner-specific hyperparameters (or `model_args`).
@@ -202,15 +221,16 @@ Automatic outcome coercion:
 
 Supported model families:
 
-* Binary/continuous non-survival: any available `SuperLearner` `SL.*` model.
+* Binary/continuous non-survival: IntegratedLearner `sl_*` wrappers (or any available standard SuperLearner `SL.*` model).
 * Multiclass non-survival: `glmnet`, `randomforest`, `ranger`, `xgboost`, `mbart`, `multinom`.
 * Survival: `surv.coxph`, `surv.glmnet`, `surv.ranger`, `surv.ranger.extratrees`, `surv.ranger.maxstat`, `surv.ranger.C`, `surv.rfsrc`, `surv.coxboost`, `surv.gbm`, `surv.xgboost.cox`, `surv.xgboost.aft`, `surv.mboost`, `surv.bart`.
+* Direct cooperative learning: standalone `multiview` feature-level fusion for continuous, binary, and survival outcomes. Multiclass cooperative learning is not supported.
 
 Supported fusion modules:
 
-* Continuous/Binary: single-layer + early (`run_concat`) + late (`run_stacked`).
-* Multiclass: single-layer + early (`run_concat`) + late (`run_stacked`).
-* Survival: single-layer + early (`do_early_fusion`) + late weighted fusion with both `COX` and `IBS` outputs returned.
+* Continuous/Binary: either standard IL mode with single-layer + early (`run_concat`) + late (`run_stacked`), or standalone cooperative mode (`run_intermediate`).
+* Multiclass: single-layer + early (`run_concat`) + late (`run_stacked`). `run_intermediate` is ignored with a message.
+* Survival: either standard IL mode with single-layer + early (`do_early_fusion`) + late weighted fusion with both `COX` and `IBS`, or standalone cooperative mode (`run_intermediate`).
 
 #### The IntegratedLearner workflow
 
@@ -220,11 +240,13 @@ Supported fusion modules:
 
 For continuous/binary fits (`IL_conbin` path):
 
-* `SL_fits`: Fitted SuperLearner objects (layer-wise, stacked, concatenated as applicable).
-* `model_fits`: Extracted learner objects.
-* `X_train_layers`, `Y_train`, `yhat.train`: training inputs and predictions.
+* `SL_fits`: Fitted SuperLearner objects (layer-wise, stacked, concatenated as applicable in standard IL mode).
+* `model_fits`: Extracted learner objects. In standalone cooperative mode this contains only `model_fits$model_cooperative`.
+* `X_train_layers`, `Y_train`, `yhat.train`: training inputs and predictions. In standalone cooperative mode, `yhat.train` contains only the `cooperative` column.
 * `X_test_layers`, `Y_test`, `yhat.test`: validation inputs and predictions (if validation provided).
 * `weights`: Layer weights in stacked model (`meta_learner = "sl_nnls_auc"` and `run_stacked = TRUE`).
+* `model_fits$model_cooperative`, `yhat.train[, "cooperative"]`, and `yhat.test[, "cooperative"]`: standalone cooperative `multiview` model and predictions when `run_intermediate = TRUE`.
+* `cooperative_feature_importance`, `cooperative_feature_importance_by_layer`, `cooperative_feature_importance_signed`, and `cooperative_feature_importance_signed_by_layer`: coefficient-based feature-importance scores from the selected cooperative `multiview` model when `run_intermediate = TRUE`.
 * `AUC.train`/`AUC.test` (binomial) or `R2.train`/`R2.test` (gaussian).
 * `feature_importance_signed`: Global signed feature importance.
 * `feature_importance_signed_by_layer`: Per-layer signed feature importance.
@@ -240,11 +262,14 @@ For multiclass fits (`IL_multiclass` path):
 
 For survival fits (`ILsurv` path):
 
-* `train_out$single`: Single-layer metrics.
-* `train_out$early`: Early-fusion metrics (if enabled).
-* `train_out$late$IBS` and `train_out$late$COX`: Late-fusion metrics and learned layer weights for both survival fusion strategies.
+* `train_out$single`: Single-layer metrics in standard IL survival mode.
+* `train_out$early`: Early-fusion metrics in standard IL survival mode (if enabled).
+* `train_out$late$IBS` and `train_out$late$COX`: Late-fusion metrics and learned layer weights for both survival fusion strategies in standard IL survival mode.
+* `train_out$single$feature_importance_signed_by_layer`: Per-layer signed survival feature-importance scores from the single-layer survival base models.
+* `train_out$cooperative` / `valid_out$cooperative`: standalone cooperative `multiview` Cox model metrics and risk scores when `run_intermediate = TRUE`.
+* `train_out$cooperative$feature_importance`, `train_out$cooperative$feature_importance_by_layer`, `train_out$cooperative$feature_importance_signed`, and `train_out$cooperative$feature_importance_signed_by_layer`: coefficient-based survival feature-importance scores from the selected cooperative `multiview` Cox model when `run_intermediate = TRUE`.
 * `valid_out$...`: Validation analogs of single/early/late outputs (if validation provided).
-* `train_out$late$combined_importance` and (if available) `train_out$early$combined_importance`: survival feature-importance outputs.
+* `train_out$late$IBS$combined_importance`, `train_out$late$COX$combined_importance`, and (if available) `train_out$early$combined_importance`: survival feature-importance outputs.
 
 Citation
 --------

@@ -29,6 +29,10 @@ ILsurv(
   optim_maxit_cox = 4000,
   optim_maxit_ibs = 300,
   ibs_shrink_to_uniform = 0,
+  run_intermediate = FALSE,
+  cooperative_rho = c(0, 0.1, 0.25, 0.5, 1),
+  cooperative_s = "lambda.min",
+  cooperative_type_measure = NULL,
   ...
 )
 
@@ -56,6 +60,10 @@ IL_survival(
   optim_maxit_cox = 4000,
   optim_maxit_ibs = 300,
   ibs_shrink_to_uniform = 0,
+  run_intermediate = FALSE,
+  cooperative_rho = c(0, 0.1, 0.25, 0.5, 1),
+  cooperative_s = "lambda.min",
+  cooperative_type_measure = NULL,
   ...
 )
 }
@@ -134,14 +142,34 @@ is \code{NULL}.}
 \item{ibs_shrink_to_uniform}{Optional convex shrinkage of IBS weights toward
 uniform.}
 
+\item{run_intermediate}{Should standalone cooperative learning via
+\pkg{multiview} be run? Default is FALSE. When TRUE, only the cooperative
+multiview Cox model is fit; survival base learners, early fusion, and late
+fusion are skipped.}
+
+\item{cooperative_rho}{Non-negative agreement-penalty values to evaluate for
+cooperative learning.}
+
+\item{cooperative_s}{Penalty value used when predicting from the selected
+cooperative model. Defaults to \code{"lambda.min"}.}
+
+\item{cooperative_type_measure}{Optional \pkg{multiview} CV loss/score. If
+\code{NULL}, Harrell's C is used.}
+
 \item{...}{Additional base-learner hyperparameters passed to
 \code{base_learner}. You may also pass \code{model_args = list(...)} as a
 named list where each entry is keyed by learner ID.}
 }
 \value{
-List with \code{train_out} and \code{valid_out}. Late-fusion results
+List with \code{train_out} and \code{valid_out}. Single-layer
+survival outputs include \code{train_out$single$metrics},
+\code{train_out$single$train_risk}, and
+\code{train_out$single$feature_importance_signed_by_layer}, a named list of
+unweighted signed feature-importance scores by layer. Late-fusion results
 are returned under \code{train_out$late$IBS}, \code{train_out$late$COX},
-and the analogous validation entries.
+and the analogous validation entries. When \code{run_intermediate = TRUE},
+\code{train_out$cooperative} includes coefficient-based cooperative
+feature-importance scores from the selected \pkg{multiview} Cox model.
 }
 \description{
 BioC-friendly survival backend used by \code{IntegratedLearner()} for
