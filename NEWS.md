@@ -1,3 +1,58 @@
+# IntegratedLearner 0.99.6
+
+## Survival IBS fusion
+
+- Fixed sample alignment in IBS weight optimization: layer survival matrices now
+  use the same time-ordering permutation as outcomes and censoring weights.
+  Previously, unsorted training data could pair predictions with another
+  sample's outcome and yield incorrect fusion weights.
+- Added regression coverage comparing learned weights with an independently
+  evaluated IPCW Brier objective and checking sample-order invariance of weights
+  and fused survival curves for fixed layer predictions, including tied times,
+  censoring, multiple layers, and optional shrinkage toward uniform weights.
+- Removed validation-outcome recalibration from survival probability scoring.
+  Single-layer, early-fusion, Cox-fusion, and cooperative models now reuse
+  calibration fitted only to training outcomes and OOF risks; validation
+  predictions preserve the training Cox coefficients, baseline survival,
+  missing-risk replacement, and Brier time grid.
+- Compute training and validation IBS-fusion Brier scores directly from the
+  blended survival matrices, without fitting an additional model to their
+  scalar risk summaries. AUC and concordance retain their existing risk-marker
+  definitions and evaluation grids.
+- Added `brier_time_grid`, stored `survival_calibration` objects, and
+  `train_surv`/`valid_surv` matrices for inspecting the probabilities actually
+  evaluated. The metric helper no longer fits calibration implicitly.
+- Added regression tests for frozen/serialized calibration, validation-label
+  independence of probabilities, direct IBS scoring, and cooperative survival
+  calibration. Updated the help, README, vignette, and manuscript accordingly.
+  Rerun affected earlier survival probability-error analyses before reporting
+  results; the package version remains 0.99.6 for these corrections.
+
+# IntegratedLearner 0.99.5
+
+## Multiclass stacking
+
+- Grouped multiclass results under survival-style `train_out` and `valid_out`
+  entries for `single`, `early`, and all enabled `late` methods. Each method
+  includes probabilities, classes, and metrics, with final and fold-specific
+  weights for learned averaging. Prediction returns the same validation layout;
+  existing flat outputs are preserved. Added `late_methods` to enumerate outputs.
+- Added majority voting (`majority`) and an out-of-fold log-loss-weighted
+  probability average (`weighted_average`) to multiclass fitting, prediction,
+  and metrics. Both default to enabled and can be disabled independently with
+  `run_majority` and `run_weighted`. Majority voting returns vote fractions and
+  resolves ties by training class order. Final averaging weights are stored in
+  `model_fits$model_weighted$weights`; training predictions cross-fit these
+  weights across the existing folds.
+- Fit the final multiclass meta-model on out-of-fold layer probabilities,
+  matching the inputs used to train the cross-validated stack and reducing
+  overfitting from in-sample base predictions.
+- Updated the README, vignette, and fitting, prediction, and plotting help for
+  all multiclass fusion methods, grouped results, and evaluation caveats.
+- Clarified the existing multiclass class-association importance calculation
+  and per-layer grouping. Corrected documentation to describe feature-by-class
+  matrices and an unsigned global ranking; the calculation is unchanged.
+
 # IntegratedLearner 0.99.4
 
 ## Tutorial data and documentation
